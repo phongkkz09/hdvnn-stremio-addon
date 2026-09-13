@@ -2,11 +2,31 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const puppeteer = require('puppeteer');
 
 const app = express();
 const PORT = process.env.PORT || 7000;
 
 const BASE_URL = 'https://hdvnn.xyz';
+
+// Browser instance (shared)
+let browser = null;
+
+// Initialize browser
+async function initBrowser() {
+  if (!browser) {
+    try {
+      browser = await puppeteer.launch({
+        headless: 'new',
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+      });
+      console.log('✓ Puppeteer browser initialized');
+    } catch (e) {
+      console.error('✗ Failed to init Puppeteer:', e.message);
+    }
+  }
+  return browser;
+}
 
 // Middleware
 app.use(cors());
@@ -179,61 +199,80 @@ function parseMovieDetail(html, id) {
   };
 }
 
-// Helper: Parse stream from episode page
+// Helper: Parse stream from episode page using Puppeteer
 async function getStreamUrl(slug, episode = null) {
   const url = episode 
-    ? `${BASE_URL}/xem-phim/${slug}-${episode}.html`
+    ? `${BASE_URL}/xem-phim/${slug}-episode-id-${episode}.html`
     : `${BASE_URL}/xem-phim/${slug}.html`;
   
-  const html = await fetchPage(url);
-  if (!html) return null;
-  
-  const $ = cheerio.load(html);
-  
-  // Look for video source in various formats
-  let streamUrl = null;
-  
-  // Try to find video URL in script tags
-  $('script').each((i, el) => {
-    const script = $(el).html() || '';
-    
-    // Common patterns for video URLs
-    const patterns = [
-      /source:\s*['"]([^'"]+\.(?:m3u8|mp4)[^'"]*)['"]/i,
-      /file:\s*['"]([^'"]+\.(?:m3u8|mp4)[^'"]*)['"]/i,
-      /src:\s*['"]([^'"]+\.(?:m3u8|mp4)[^'"]*)['"]/i,
-      /url:\s*['"]([^'"]+\.(?:m3u8|mp4)[^'"]*)['"]/i,
-      /["']([^"']*(?:\.m3u8|\.mp4)[^"']*)["']/gi
-    ];
-    
-    for (const pattern of patterns) {
-      const match = script.match(pattern);
-      if (match && match[1]) {
-        streamUrl = match[1];
-        break;
-      }
+  try {
+    const br = await initBrowser();
+    if (!br) {
+      console.log('Browser not available, returning null');
+      return null;
     }
     
-    if (streamUrl) return false;
-  });
-  
-  // Check iframe sources
-  if (!streamUrl) {
-    $('iframe').each((i, el) => {
-      const src = $(el).attr('src') || '';
-      if (src.includes('embed') || src.includes('player') || src.includes('video')) {
-        streamUrl = src;
-        return false;
+    const page = await br.newPage();
+    page.setDefaultTimeout(15000);
+    page.setDefaultNavigationTimeout(15000);
+    
+    // Set viewport để tránh mobile layout
+    await page.setViewport({ width: 1280, height: 720 });
+    
+    // Navigate và wait for player
+    await page.goto(url, { waitUntil: 'networkidle2' });
+    
+    // Wait for video player
+    await page.waitForSelector('#video-player, .jwplayer, video', { timeout: 5000 }).catch(() => {});
+    
+    // Extract stream URL từ page
+    const streamUrl = await page.evaluate(() => {
+      // Try JW Player
+      if (window.jwplayer && typeof window.jwplayer === 'function') {
+        try {
+          const player = window.jwplayer('video-player');
+          if (player && player.getPlaylist) {
+            const playlist = player.getPlaylist();
+            if (playlist && playlist.length > 0) {
+              const sources = playlist[0].sources;
+              if (sources && sources.length > 0) {
+                return sources[0].file;
+              }
+            }
+          }
+        } catch (e) {}
       }
+      
+      // Try video element
+      const video = document.querySelector('video source');
+      if (video && video.src) {
+        return video.src;
+      }
+      
+      // Try iframe
+      const iframes = document.querySelectorAll('iframe');
+      for (let iframe of iframes) {
+        const src = iframe.src || '';
+        if (src.includes('embed') || src.includes('player') || src.includes('video')) {
+          return src;
+        }
+      }
+      
+      return null;
     });
+    
+    await page.close();
+    
+    if (streamUrl && (streamUrl.includes('.m3u8') || streamUrl.includes('.mp4') || streamUrl.includes('embed'))) {
+      console.log('✓ Found stream URL:', streamUrl.substring(0, 100));
+      return streamUrl;
+    }
+    
+    return null;
+  } catch (error) {
+    console.error(`Error getting stream from ${url}:`, error.message);
+    return null;
   }
-  
-  // Check video element
-  if (!streamUrl) {
-    streamUrl = $('video source').attr('src') || $('video').attr('src');
-  }
-  
-  return streamUrl;
 }
 
 // Routes
