@@ -207,6 +207,84 @@ async function getEpisodeIds(slug) {
   return episodes;
 }
 
+// Helper: Get stream URLs from API
+async function getStreamSources(movieId, episodeId) {
+  try {
+    console.log(`📡 Calling API for MovieID=${movieId}, EpisodeID=${episodeId}`);
+    
+    const response = await axios.post(
+      `${BASE_URL}/server/ajax/player`,
+      new URLSearchParams({
+        MovieID: movieId,
+        EpisodeID: episodeId
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Referer': `${BASE_URL}/xem-phim/episode-id-${episodeId}.html`
+        },
+        timeout: 15000
+      }
+    );
+    
+    console.log('✓ API Response:', JSON.stringify(response.data).substring(0, 200));
+    
+    const data = response.data;
+    
+    if (data.code !== 200 || !data.src_hy) {
+      console.log('✗ API returned error or no src_hy');
+      return null;
+    }
+    
+    // Extract stream URLs
+    const sources = [];
+    
+    // Server PT (Google) - usually best quality
+    if (data.src_pt && data.src_pt.includes('google')) {
+      sources.push({
+        name: 'HDvnn - Server PT',
+        title: 'Server PT (Google)',
+        url: data.src_pt
+      });
+    }
+    
+    // Server HY (abyssplayer)
+    if (data.src_hy) {
+      sources.push({
+        name: 'HDvnn - Server HY',
+        title: 'Server HY (Abyss)',
+        externalUrl: data.src_hy
+      });
+    }
+    
+    // Server VNN (VK)
+    if (data.src_vnn_1) {
+      sources.push({
+        name: 'HDvnn - Server VNN',
+        title: 'Server VNN (VK)',
+        externalUrl: data.src_vnn_1
+      });
+    }
+    
+    console.log(`✓ Found ${sources.length} sources`);
+    return sources.length > 0 ? sources : null;
+  } catch (error) {
+    console.error('✗ Error fetching stream sources:', error.message);
+    return null;
+  }
+}
+
+// Helper: Get MovieID from episode page
+async function getMovieId(slug, episodeId) {
+  const url = `${BASE_URL}/xem-phim/${slug}-episode-id-${episodeId}.html`;
+  const html = await fetchPage(url);
+  if (!html) return null;
+  
+  const match = html.match(/MovieID:\s*(\d+)/);
+  return match ? match[1] : null;
+}
+
 // Routes
 
 // Manifest endpoint
@@ -290,36 +368,48 @@ app.get('/stream/:type/:id.json', async (req, res) => {
   
   try {
     if (type === 'series') {
-      // Get episode URLs from the movie page
+      // Get episode IDs
       const episodes = await getEpisodeIds(slug);
       const streams = [];
       
       if (episodes.length > 0) {
-        // Return direct links to each episode page
-        // Stremio will pick the first one by default
-        for (const ep of episodes.slice(0, 5)) { // Limit to first 5 to avoid huge response
-          const epUrl = ep.url.startsWith('http') ? ep.url : BASE_URL + ep.url;
+        // Get MovieID from first episode
+        const firstEp = episodes[0];
+        const movieId = await getMovieId(slug, firstEp.id);
+        
+        if (movieId) {
+          // Get stream sources from API
+          const sources = await getStreamSources(movieId, firstEp.id);
+          
+          if (sources && sources.length > 0) {
+            // Return direct stream URLs
+            streams.push(...sources);
+          }
+        }
+        
+        // Fallback: link to episode page
+        if (streams.length === 0) {
+          const epUrl = firstEp.url.startsWith('http') ? firstEp.url : BASE_URL + firstEp.url;
           streams.push({
-            name: `HDvnn - Tập ${ep.number}`,
-            title: `Xem Tập ${ep.number} trên HDvnn.xyz`,
+            name: 'HDvnn - Xem trên web',
+            title: `Xem Tập ${firstEp.number} trên HDvnn.xyz`,
             externalUrl: epUrl
           });
         }
       } else {
-        // Fallback: link to movie detail page
         streams.push({
           name: 'HDvnn - Xem trên web',
-          title: `Xem phim trên HDvnn.xyz`,
+          title: 'Xem phim trên HDvnn.xyz',
           externalUrl: `${BASE_URL}/thong-tin-phim/${slug}.html`
         });
       }
       
       res.json({ streams });
     } else {
-      // Movie - link directly to the movie page
+      // Movie - try to get stream
       const streams = [{
         name: 'HDvnn - Xem trên web',
-        title: `Xem phim trên HDvnn.xyz`,
+        title: 'Xem phim trên HDvnn.xyz',
         externalUrl: `${BASE_URL}/thong-tin-phim/${slug}.html`
       }];
       
@@ -330,7 +420,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
     res.json({
       streams: [{
         name: 'HDvnn - Xem trên web',
-        title: `Xem phim trên HDvnn.xyz`,
+        title: 'Xem phim trên HDvnn.xyz',
         externalUrl: `${BASE_URL}/thong-tin-phim/${slug}.html`
       }]
     });
