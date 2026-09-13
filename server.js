@@ -98,6 +98,7 @@ function parseMovieList(html) {
 
   // Fallback: try alternative selectors
   if (movies.length === 0) {
+    const seenIds = new Set();
     $('a[href*="/thong-tin-phim/"]').each((i, el) => {
       try {
         const $el = $(el);
@@ -105,17 +106,29 @@ function parseMovieList(html) {
         const title = $el.attr('title') || $el.text().trim().split('\n')[0];
         const poster = $el.find('img').attr('src') || '';
         
-        if (href && title && !movies.find(m => m.id === `hdvnn_${href.replace('/thong-tin-phim/', '').replace('.html', '')}`)) {
-          const slug = href.replace('/thong-tin-phim/', '').replace('.html', '');
+        if (href && title) {
+          // Handle both relative and absolute URLs
+          // Extract slug from URL like: https://hdvnn.xyz/thong-tin-phim/quang-am-chi-ngoai.html
+          let slug = href;
+          const match = slug.match(/\/thong-tin-phim\/([^\/]+)\.html/);
+          if (match && match[1]) {
+            slug = match[1];
+          } else {
+            slug = slug.replace(/.*\/thong-tin-phim\//, '').replace(/\.html.*$/, '').replace(/\/$/, '');
+          }
+          
           const id = `hdvnn_${slug}`;
           
-          movies.push({
-            id: id,
-            type: 'series', // Default to series for Asian content sites
-            name: title.replace(/\d+\/\d+|\d+\/\?|VS-TM|TM|LT|4K|Phút/gi, '').trim(),
-            poster: poster.startsWith('http') ? poster : (poster ? BASE_URL + poster : ''),
-            posterShape: 'poster'
-          });
+          if (!seenIds.has(id)) {
+            seenIds.add(id);
+            movies.push({
+              id: id,
+              type: 'series', // Default to series for Asian content sites
+              name: title.replace(/\d+\/\d+|\d+\/\?|VS-TM|TM|LT|4K|Phút/gi, '').trim(),
+              poster: poster.startsWith('http') ? poster : (poster ? BASE_URL + poster : ''),
+              posterShape: 'poster'
+            });
+          }
         }
       } catch (e) {}
     });
