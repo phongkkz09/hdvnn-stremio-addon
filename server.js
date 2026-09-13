@@ -2,31 +2,11 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const puppeteer = require('puppeteer');
 
 const app = express();
 const PORT = process.env.PORT || 7000;
 
 const BASE_URL = 'https://hdvnn.xyz';
-
-// Browser instance (shared)
-let browser = null;
-
-// Initialize browser
-async function initBrowser() {
-  if (!browser) {
-    try {
-      browser = await puppeteer.launch({
-        headless: 'new',
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-      });
-      console.log('✓ Puppeteer browser initialized');
-    } catch (e) {
-      console.error('✗ Failed to init Puppeteer:', e.message);
-    }
-  }
-  return browser;
-}
 
 // Middleware
 app.use(cors());
@@ -199,80 +179,32 @@ function parseMovieDetail(html, id) {
   };
 }
 
-// Helper: Parse stream from episode page using Puppeteer
-async function getStreamUrl(slug, episode = null) {
-  const url = episode 
-    ? `${BASE_URL}/xem-phim/${slug}-episode-id-${episode}.html`
-    : `${BASE_URL}/xem-phim/${slug}.html`;
+// Helper: Get episode IDs from movie page
+async function getEpisodeIds(slug) {
+  const url = `${BASE_URL}/thong-tin-phim/${slug}.html`;
+  const html = await fetchPage(url);
+  if (!html) return [];
   
-  try {
-    const br = await initBrowser();
-    if (!br) {
-      console.log('Browser not available, returning null');
-      return null;
+  const $ = cheerio.load(html);
+  const episodes = [];
+  
+  // Find episode links with format: /xem-phim/{slug}-episode-id-{id}.html
+  $('a[href*="episode-id"]').each((i, el) => {
+    const href = $(el).attr('href') || '';
+    const match = href.match(/episode-id-(\d+)/);
+    if (match && match[1]) {
+      const epId = match[1];
+      if (!episodes.find(e => e.id === epId)) {
+        episodes.push({
+          id: epId,
+          url: href,
+          number: parseInt($(el).text().trim()) || episodes.length + 1
+        });
+      }
     }
-    
-    const page = await br.newPage();
-    page.setDefaultTimeout(15000);
-    page.setDefaultNavigationTimeout(15000);
-    
-    // Set viewport để tránh mobile layout
-    await page.setViewport({ width: 1280, height: 720 });
-    
-    // Navigate và wait for player
-    await page.goto(url, { waitUntil: 'networkidle2' });
-    
-    // Wait for video player
-    await page.waitForSelector('#video-player, .jwplayer, video', { timeout: 5000 }).catch(() => {});
-    
-    // Extract stream URL từ page
-    const streamUrl = await page.evaluate(() => {
-      // Try JW Player
-      if (window.jwplayer && typeof window.jwplayer === 'function') {
-        try {
-          const player = window.jwplayer('video-player');
-          if (player && player.getPlaylist) {
-            const playlist = player.getPlaylist();
-            if (playlist && playlist.length > 0) {
-              const sources = playlist[0].sources;
-              if (sources && sources.length > 0) {
-                return sources[0].file;
-              }
-            }
-          }
-        } catch (e) {}
-      }
-      
-      // Try video element
-      const video = document.querySelector('video source');
-      if (video && video.src) {
-        return video.src;
-      }
-      
-      // Try iframe
-      const iframes = document.querySelectorAll('iframe');
-      for (let iframe of iframes) {
-        const src = iframe.src || '';
-        if (src.includes('embed') || src.includes('player') || src.includes('video')) {
-          return src;
-        }
-      }
-      
-      return null;
-    });
-    
-    await page.close();
-    
-    if (streamUrl && (streamUrl.includes('.m3u8') || streamUrl.includes('.mp4') || streamUrl.includes('embed'))) {
-      console.log('✓ Found stream URL:', streamUrl.substring(0, 100));
-      return streamUrl;
-    }
-    
-    return null;
-  } catch (error) {
-    console.error(`Error getting stream from ${url}:`, error.message);
-    return null;
-  }
+  });
+  
+  return episodes;
 }
 
 // Routes
@@ -356,80 +288,52 @@ app.get('/stream/:type/:id.json', async (req, res) => {
   
   const slug = id.replace('hdvnn_', '');
   
-  // For series, try to get all episodes
-  if (type === 'series') {
-    const detailUrl = `${BASE_URL}/thong-tin-phim/${slug}.html`;
-    const html = await fetchPage(detailUrl);
-    
-    if (!html) {
-      return res.json({ streams: [] });
-    }
-    
-    const $ = cheerio.load(html);
-    const streams = [];
-    
-    // Get episode count from page
-    const episodeLinks = [];
-    $('a[href*="tap"], a[href*="episode"], .episode a, [class*="episode"] a').each((i, el) => {
-      const epNum = parseInt($(el).text().trim());
-      if (!isNaN(epNum) && !episodeLinks.includes(epNum)) {
-        episodeLinks.push(epNum);
-      }
-    });
-    
-    // If no episode links found, check if there's episode list
-    if (episodeLinks.length === 0) {
-      // Try to find episode count in text
-      const epMatch = html.match(/(\d+)\/\d+/);
-      if (epMatch) {
-        const total = parseInt(epMatch[2]) || parseInt(epMatch[1]);
-        for (let i = 1; i <= total; i++) {
-          episodeLinks.push(i);
+  try {
+    if (type === 'series') {
+      // Get episode URLs from the movie page
+      const episodes = await getEpisodeIds(slug);
+      const streams = [];
+      
+      if (episodes.length > 0) {
+        // Return direct links to each episode page
+        // Stremio will pick the first one by default
+        for (const ep of episodes.slice(0, 5)) { // Limit to first 5 to avoid huge response
+          const epUrl = ep.url.startsWith('http') ? ep.url : BASE_URL + ep.url;
+          streams.push({
+            name: `HDvnn - Tập ${ep.number}`,
+            title: `Xem Tập ${ep.number} trên HDvnn.xyz`,
+            externalUrl: epUrl
+          });
         }
+      } else {
+        // Fallback: link to movie detail page
+        streams.push({
+          name: 'HDvnn - Xem trên web',
+          title: `Xem phim trên HDvnn.xyz`,
+          externalUrl: `${BASE_URL}/thong-tin-phim/${slug}.html`
+        });
       }
+      
+      res.json({ streams });
+    } else {
+      // Movie - link directly to the movie page
+      const streams = [{
+        name: 'HDvnn - Xem trên web',
+        title: `Xem phim trên HDvnn.xyz`,
+        externalUrl: `${BASE_URL}/thong-tin-phim/${slug}.html`
+      }];
+      
+      res.json({ streams });
     }
-    
-    // For now, provide links to watch on site
-    // In production, you'd parse actual video URLs
-    streams.push({
-      name: `HDvnn - Xem trên web`,
-      title: `Xem phim tại HDvnn.xyz`,
-      externalUrl: `${BASE_URL}/thong-tin-phim/${slug}.html`
+  } catch (error) {
+    console.error('Stream error:', error.message);
+    res.json({
+      streams: [{
+        name: 'HDvnn - Xem trên web',
+        title: `Xem phim trên HDvnn.xyz`,
+        externalUrl: `${BASE_URL}/thong-tin-phim/${slug}.html`
+      }]
     });
-    
-    // Try to get direct stream
-    const streamUrl = await getStreamUrl(slug, 1);
-    if (streamUrl && (streamUrl.includes('.m3u8') || streamUrl.includes('.mp4'))) {
-      streams.unshift({
-        name: 'HDvnn - Server 1',
-        title: 'Xem trực tiếp',
-        url: streamUrl.startsWith('http') ? streamUrl : BASE_URL + streamUrl
-      });
-    }
-    
-    res.json({ streams });
-  } else {
-    // Movie
-    const streams = [];
-    
-    // Try to get direct stream
-    const streamUrl = await getStreamUrl(slug);
-    if (streamUrl && (streamUrl.includes('.m3u8') || streamUrl.includes('.mp4'))) {
-      streams.push({
-        name: 'HDvnn - Server 1',
-        title: 'Xem trực tiếp',
-        url: streamUrl.startsWith('http') ? streamUrl : BASE_URL + streamUrl
-      });
-    }
-    
-    // Fallback to website
-    streams.push({
-      name: `HDvnn - Xem trên web`,
-      title: `Xem phim tại HDvnn.xyz`,
-      externalUrl: `${BASE_URL}/thong-tin-phim/${slug}.html`
-    });
-    
-    res.json({ streams });
   }
 });
 
